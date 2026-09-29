@@ -18,6 +18,7 @@ from navid.mm_utils import tokenizer_image_token, get_model_name_from_path, Keyw
 
 
 
+# 定义了 NaVid Agent 类，继承自 Habitat 的 Agent 类，用于处理导航任务。该类主要负责初始化模型、处理图像、进行推理、提取结果、添加文本信息到图像、重置状态以及执行动作。
 class NaVid_Agent(Agent):
     def __init__(self, model_path, result_path, require_map=True):
         
@@ -251,6 +252,8 @@ class NaVid_Agent(Agent):
             top_down_map = maps.colorize_draw_agent_and_fit_to_height(info["top_down_map_vlnce"], rgb.shape[0])
             output_im = np.concatenate((rgb, top_down_map), axis=1)
 
+        # 这里还不是每个动作都去调用模型去推理，而是先把模型推理出来的动作缓存到一个列表里面，等到下一步的时候再去取这个列表里面的动作
+        # 列表里面如果已经有动作了，就直接执行
         if len(self.pending_action_list) != 0 :
             temp_action = self.pending_action_list.pop(0)
             

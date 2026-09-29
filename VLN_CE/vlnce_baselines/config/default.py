@@ -4,6 +4,8 @@ from typing import List, Optional, Union
 import habitat_baselines.config.default
 import numpy as np
 from habitat.config.default import CONFIG_FILE_SEPARATOR
+
+# CN 是 habitat 的 Config 类，继承自 yacs.config.CfgNode，yacs 是一个轻量级的配置管理工具
 from habitat.config.default import Config as CN
 
 from VLN_CE.habitat_extensions.config.default import (
@@ -291,6 +293,10 @@ def purge_keys(config: CN, keys: List[str]) -> None:
         config.register_deprecated_key(k)
 
 
+# 按"默认值 → 配置文件 → 命令行覆盖"的优先级，把配置拼成一个统一对象，最后冻结
+# 注意：这是"配置装配"函数，不涉及数据加载、模型推理等核心业务逻辑，
+# 职责只有两件事：① 按优先级合并配置；② 把 yaml 里 BASE_TASK_CONFIG_PATH 指向的
+# task 配置递归读进来挂成 TASK_CONFIG 子树。合并顺序即优先级，后面的覆盖前面的。
 def get_config(
     config_paths: Optional[Union[List[str], str]] = None,
     opts: Optional[list] = None,
@@ -305,21 +311,38 @@ def get_config(
         command line into the config. For example, `opts = ['FOO.BAR',
         0.5]`. Argument can be used for parameter sweeping or quick tests.
     """
+    # 第 1 层：空壳。CN 就是 habitat 的 Config，此时还没挂任何默认值
     config = CN()
+    # 第 2 层：铺 habitat_baselines 的默认配置作为底座
     config.merge_from_other_cfg(habitat_baselines.config.default._C)
+    # 删掉底座里两个已废弃的键 SIMULATOR_GPU_ID / TEST_EPISODE_COUNT。
+    # purge_keys 除了 del 之外还会 register_deprecated_key，这样后续若有代码再访问
+    # 这两个键会明确报错而不是静默拿到脏值，属于删键的标准做法。
     purge_keys(config, ["SIMULATOR_GPU_ID", "TEST_EPISODE_COUNT"])
+    # 第 3 层：叠上 VLN-CE 自己的默认值（即本文件顶部定义的那一大坨 _C）。
+    # 这里必须 .clone()：否则 merge 过程中可能就地修改到模块级全局 _C，
+    # 污染会被下一次调用读到，导致同一进程内多次 get_config 结果不一致。
     config.merge_from_other_cfg(_C.clone())
 
     if config_paths:
+        # 允许把多个配置路径用逗号拼成一个字符串传入，这里统一展开成 list，
+        # 以便下面按顺序逐个 merge，靠后的文件优先级更高（前面的可被覆盖）。
         if isinstance(config_paths, str):
             if CONFIG_FILE_SEPARATOR in config_paths:
                 config_paths = config_paths.split(CONFIG_FILE_SEPARATOR)
             else:
                 config_paths = [config_paths]
 
+        # prev_task_config 记录"上一次已加载的 task 配置路径"，
+        # 作用是多份配置文件引用同一个 task 配置时只加载一次，省掉重复解析开销。
         prev_task_config = ""
         for config_path in config_paths:
+            # 第 4 层：合并单个 yaml 配置文件，优先级高于前三层默认值
             config.merge_from_file(config_path)
+            # 关键一步：yaml 里的 BASE_TASK_CONFIG_PATH 指向 habitat 的 task 配置，
+            # 一旦它发生变化就把整份 task 配置读进来挂到 config.TASK_CONFIG 子树。
+            # 因此最终的 config 里实际住着两层：外层是实验级配置（EVAL/IL/RL/MODEL），
+            # 内层 TASK_CONFIG 才是仿真器/任务/数据集配置（SIMULATOR/TASK/DATASET）。
             if config.BASE_TASK_CONFIG_PATH != prev_task_config:
                 config.TASK_CONFIG = get_task_config(
                     config.BASE_TASK_CONFIG_PATH
@@ -327,9 +350,14 @@ def get_config(
                 prev_task_config = config.BASE_TASK_CONFIG_PATH
 
     if opts:
+        # 第 5 层：调用方/命令行传入的扁平覆盖项，优先级最高，用于参数扫描或临时试参数。
+        # 形如 ['FOO.BAR', 0.5]；除生效外还原样存进 CMD_TRAILING_OPTS 留档，便于复现本次实验。
         config.CMD_TRAILING_OPTS = opts
         config.merge_from_list(opts)
 
+    # 冻结为只读后再返回：调用方若需修改必须先 defrost()，否则会抛异常。
+    # 这样可以挡住运行期对配置的意外改写，具体用法可参考本文件下方的
+    # add_pano_sensors_to_config（它先 defrost 再改，改完重新 freeze）。
     config.freeze()
     return config
 

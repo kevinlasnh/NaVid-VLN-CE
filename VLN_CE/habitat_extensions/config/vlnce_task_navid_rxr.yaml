@@ -1,4 +1,5 @@
 ENVIRONMENT:
+  # 这里还有一个最大 episode 步数限制，超过这个步数就强制结束 episode
   MAX_EPISODE_STEPS: 500
 SIMULATOR:
   ACTION_SPACE_CONFIG: v0

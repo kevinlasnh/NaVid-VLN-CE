@@ -8,11 +8,17 @@
 
 ## 下一步
 
-等待用户选定学习路线（沿数据流逐层精读 / 主题式深挖核心机制 / 先建全局索引 / 先跑通再理解），选定后进入阶段 2 的逐段讲解。
+继续阶段 2 的模型侧精读，顺序为：
+1. `navid/model/language_model/llava_navid.py` 的 `forward()`（先拿执行流程图，约 70 行）
+2. `navid/model/navid_arch.py` 的 `prepare_inputs_labels_for_multimodal()`（231-485 行，全文件核心）
+3. 回头补 `encode_images` / `vlm_attention` / `token_generation` / `update_prompt`
+4. `navid/model/multimodal_encoder/eva_vit.py` 快扫（只看输入尺寸、patch 数、输出维度、惰性加载）
+
+待用户确认的事项：`navid/model/builder.py:122` 的 `context_len3` 缺陷是否修复。
 
 ## 当前阶段
 
-阶段 2：主调用链精读
+阶段 2：主调用链精读（进行中，已完成 `run.py` 与 `navid/model/builder.py`）
 
 ## 各阶段
 
@@ -34,24 +40,31 @@
 - **状态：** complete
 
 ### 阶段 2：主调用链精读
-- [ ] 精读 run.py（数据集切分、主循环、早停逻辑）
-- [ ] 精读 agent_navid.py 的 act() 完整生命周期
+- [x] 精读 run.py（数据集切分、主循环、早停逻辑）
+- [x] 精读 `navid/model/builder.py`（模型加载全流程）—— 计划外新增，因用户选定模型侧路线
+- [x] 精读 `eval_navid_vlnce.sh` 的 7 个命令行参数并补注释
+- [x] 精读 `VLN_CE/vlnce_baselines/config/default.py` 的 `get_config` 并补注释
+- [x] 厘清 habitat / VLN-CE / NaVid 三层职责边界
+- [x] 把发现记录到 findings.md
+- [ ] 精读 agent_navid.py 的 act() 完整生命周期（骨架已看，`predict_inference` / `extract_result` 未细读）
 - [ ] 精读 predict_inference() 的 token 拼接顺序
-- [ ] 把发现记录到 findings.md
+- [ ] 精读 `llava_navid.py` 的 `forward()` 执行流程图
 - **状态：** in_progress
 
 ### 阶段 3：模型侧核心机制
-- [ ] token 压缩的池化数学（token_generation）
+- [ ] `prepare_inputs_labels_for_multimodal`（255 行，全文件核心）
+- [ ] token 压缩的池化数学（token_generation + process_grid）
 - [ ] 历史帧增量复用机制（process_images + prepare_inputs_labels_for_multimodal）
 - [ ] 特殊 token 在 input_ids 中的替换与跳过逻辑
 - [ ] KV cache / 历史视觉 token 复用的真实边界
+- [ ] `eva_vit.py` 快扫（输入尺寸、patch 数、输出维度、惰性加载）
 - **状态：** pending
 
 ### 阶段 4：环境侧 VLN-CE 扩展
 - [ ] habitat_extensions 的 task / measures / sensors / actions
-- [ ] get_config 的配置合并链路
+- [x] get_config 的配置合并链路
 - [ ] 指标计算（SR / SPL / NE / OSR）与 TOP_DOWN_MAP 来源
-- **状态：** pending
+- **状态：** pending（配置合并链路一项已提前完成）
 
 ### 阶段 5：NaVid 与 Uni-NaVid 对比
 - [ ] 对比两个 agent 的差异（历史帧处理、动作输出、缓存策略）
@@ -67,9 +80,11 @@
 
 记录需要解决的重要问题，并在获得答案后更新。
 
-1. `EVAL.EARLY_STOP_ROTATION` / `EVAL.EARLY_STOP_STEPS` 在 r2r yaml 中被设置，但在 `VLN_CE/vlnce_baselines/config/default.py` 的 EVAL 段中未见定义，需确认配置合并时是否通过。
-2. `long_video` 的判定条件是 `images[0].shape[-1] > 1000`，此处 `shape[-1]` 究竟落在哪个维度，需结合 Uni-NaVid 的实际输入确认。
-3. 用户尚未选定学习路线，这决定阶段 2 的展开方式。
+1. ~~`EVAL.EARLY_STOP_ROTATION` / `EVAL.EARLY_STOP_STEPS` 在 r2r yaml 中被设置，但在 `VLN_CE/vlnce_baselines/config/default.py` 的 EVAL 段中未见定义，需确认配置合并时是否通过。~~ **已解决**：无需在 `default.py` 预定义。yacs `CfgNode` 以 `new_allowed=True` 构造，允许运行时新增键；`merge_from_file` 会把 yaml 里的新键直接挂上。但这也意味着**拼错的键不会报错，只会静默多出一个无用字段**。
+2. `long_video` 的判定条件是 `images[0].shape[-1] > 1000`，此处 `shape[-1]` 究竟落在哪个维度，需结合 Uni-NaVid 的实际输入确认。**未解决。**
+3. ~~用户尚未选定学习路线，这决定阶段 2 的展开方式。~~ **已解决**：用户选定模型侧路线（模型如何搭建），阶段 2 转为 `builder.py` → `llava_navid.py` → `navid_arch.py`。
+4. ~~`navid/model/builder.py:122` 的 `context_len3` 缺陷是否修复？~~ **已解决**：用户已改回 `context_len`，`py_compile` 通过。
+5. `agent_navid.py:317` 的 `require_data` 条件写错（`"video"` 应为 `"data"`），以及 `NaVid_Agent.__init__` 的 `require_map` 参数错位 —— 是否修复？**待用户决定**（两者都会改变 `EXP_SAVE="data"` 的行为）。
 
 ## 已做决策
 
