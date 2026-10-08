@@ -192,6 +192,43 @@ eval_navid_vlnce.sh              # 起 8 个进程，每 GPU 一个 chunk
 - 训练时由 `initialize_vision_tokenizer`（`navid_arch.py:487`，**仅 `train.py:1269` 调用**）一次加 6 个特殊 token；它们随 tokenizer 一起保存（`train.py:1290` 把 tokenizer 传给 Trainer，HF `Trainer.save_model()` 会自动存 tokenizer），推理时由 `AutoTokenizer.from_pretrained` 读回。
 - 视觉塔是**惰性加载**的（`navid_arch.py:42` 构造时传 `delay_load=True`），故需显式 `load_model()` 与手动 `.to(device, dtype)`；`image_processor` 挂在 vision_tower 上。**EVA-ViT 权重不在 NaVid 权重目录内**，需按 README 单独下载。
 
+### `navid/model/language_model/llava_navid.py` 精读要点（2026-09-29）
+
+- `LlavaConfig` 继承 `LlamaConfig`，只把 `model_type` 改成 `"llava"`；结尾的 `AutoConfig.register` 与 `AutoModelForCausalLM.register` 将配置类和模型类接入 Transformers 的 Auto 工厂。
+- `LlavaAttLlamaModel(NaVidMetaModel, LlamaModel)` 把 NaVid 的视觉塔/投影层能力与 Llama Transformer 主干组合起来；`LlavaLlamaAttForCausalLM(LlamaForCausalLM, NaVidMetaForCausalLM)` 再把多模态能力与因果语言建模能力组合起来。
+- `LlavaLlamaAttForCausalLM.__init__` 使用 `super(LlamaForCausalLM, self).__init__(config)` 跳过 `LlamaForCausalLM.__init__`，然后手动创建自定义的 `self.model = LlavaAttLlamaModel(config)` 和 `self.lm_head`，最后调用 `post_init()` 初始化完整模块树。
+- `forward()` 的数据流为：推理模式下把输入搬到模型设备 → 调用 `prepare_inputs_labels_for_multimodal()` → 将得到的 `input_ids` / `inputs_embeds` 等交给 `self.model` → 取 `outputs[0]` 作为 hidden states → 经 `lm_head` 得到 `[batch, sequence, vocab]` 的 logits → 有 labels 时用 `logits[..., :-1, :]` 对齐 `labels[..., 1:]` 计算 next-token loss。
+- `prepare_inputs_labels_for_multimodal()` 与 `prepare_inputs_for_generation()` 不是重复函数：前者在 `forward()` 内真正完成文本 token、视觉特征、特殊图像 token 的多模态拼装；后者是 Hugging Face `generate()` 使用的逐步输入调度接口，主要负责 `past_key_values` 存在时只保留最后一个 token，并把 `images` 等参数转交给 `forward()`。
+- 当前仓库中 `agent_navid.py` 的 `self.model.generate(...)` 是 `prepare_inputs_for_generation()` 的实际间接入口；因此全仓库文本搜索可能只看到该函数定义，看不到显式调用，因为调用发生在 Transformers 的生成框架内部。
+- 直接执行 `model(...)` 会走 PyTorch `nn.Module.__call__()` → `forward()`，不会自动经过 `prepare_inputs_for_generation()`；只有 `model.generate(...)` 的自回归生成路径才会经过该 hook。
+
+### `prepare_inputs_labels_for_multimodal()` 的 prompt 兜底链路（2026-10-08）
+
+- `if prompts is None and hasattr(self, 'prompts'):` 实现“显式实参优先、实例缓存兜底”：调用方传入非 `None` 的 `prompts` 时保持原值；未传时才尝试读取模型实例上的 `self.prompts`。
+- `hasattr` 在读取 `self.prompts` 前检查属性是否存在，避免尚未调用 `update_prompt()` 时直接访问该属性引发 `AttributeError`。
+- 实际推理链路为：`agent_navid.py` 在 `generate()` 前调用 `self.model.update_prompt([[cur_prompt]])` → `update_prompt()` 把提示词保存到 `self.prompts` → `forward()` 未显式传 `prompts` 时由这里取回 → 传给 `encode_images()` / `vlm_attention()`，后者据 `NAVIGATION_IDENTIFIER in prompt[0]` 判断是否为导航任务。
+
+### `prepare_inputs_labels_for_multimodal()` 的提前返回与 KV Cache 分支（2026-10-08）
+
+- 当视觉塔不存在、没有图像，或 `input_ids` 只有 1 个 token 时，函数不再编码图片和重建多模态 embedding，而是直接返回；其中单 token 情况对应 `generate()` 首轮之后的自回归解码步骤。
+- 在“已有 `past_key_values` + 视觉塔和图片仍存在 + 当前仅 1 个 token”时，之前的文本与视觉信息已经保存在 KV Cache 中。代码把 `attention_mask` 重建为 `[batch_size, cached_sequence_length + 1]` 的全 1 张量，使当前 token 可以关注全部缓存位置；`+1` 代表本轮的新 token。
+- `past_key_values[-1][-1]` 取最后一层的 value cache，其倒数第二维是缓存序列长度；返回元组第四项 `None` 对应 `inputs_embeds=None`，让下游 Llama 仅为当前 `input_ids` 做普通词嵌入，不重复插入视觉 embedding。
+
+### `encode_images()` 的双路径视觉入口（2026-10-08）
+
+- `encode_images()` 是像素/预计算特征的统一入口，不负责最终拼接文本 token。`long_video=False` 时，输入像素张量经 vision tower 从 `[总帧数, 3, 224, 224]` 编码为 `[总帧数, 257, 1408]`；`long_video=True` 时，`images` 已是这类视觉特征，直接赋给 `image_features`，避免重复执行视觉编码器。
+- 两条分支都会调用 `vlm_attention()`。后者依据 `image_counts` 把展平的总帧重新分回各个 batch 样本，依据 `prompts` 是否含 `NAVIGATION_IDENTIFIER` 判断导航任务，再通过 `token_generation()` 压缩 patch token 并用 `mm_projector` 映射到 Llama 隐藏维度。
+- 返回值不是一个裸张量，而是三个并行列表：压缩后的样本级视觉特征 `image_features`、控制后续单图/视频拼装分支的 `video_or_not`，以及导航任务当前帧的 64 个高分辨率 token `nav_or_not`（非导航样本为 `None`）。
+- `long_video` 虽继续作为关键字参数传给 `vlm_attention()`，但当前函数体内没有读取它；它在现有代码里的实际作用仅是让 `encode_images()` 跳过 vision tower。变量名表达“长视频优化场景”，实际判据则是输入最后一维是否大于 1000，即借形状区分预计算特征与像素图。
+
+### `vlm_attention()` 的样本分组与双分辨率导航 token（2026-10-08）
+
+- 该函数名虽含 `attention`，实际没有 Q/K/V 注意力计算；主流程是：校验压缩配置与 batch 元数据 → 用 `image_counts` 从展平的总帧张量中恢复每个样本 → 根据 `NAVIGATION_IDENTIFIER` 识别导航 prompt → 去除 CLS token → 调用 `token_generation()` 池化和投影 → 返回视觉特征及后续拼装分支标记。
+- `image_counts=None` 代表每个 `image_features[_idx]` 都是独立单图，代码用 `None` 索引补出帧维；提供 `image_counts` 时，`total_count` 是累计切片游标。例如 `[2, 3]` 会依次取得 `image_features[0:2]` 和 `[2:5]`。
+- 假设某样本有 `F` 帧、内层 prompt 数为 `P`、Llama 隐藏维度为 `H`：池化投影后的 `[F, T, H]` 经 `[None] → expand(P, ...) → flatten(1, 2)` 变为 `[P, F×T, H]`，从而让同一份视觉内容可供该样本的多个 prompt 复用；导航任务强制 `P=1`。
+- 普通单图固定采用 8×8 池化并输出 64 个 token，`video_or_not=False`；普通多帧视频每帧输出 `nav_size` 个 token，`video_or_not=True`；导航样本除保留所有帧的低分辨率 `nav_size` token 外，还从最后一帧额外生成 64 个高分辨率 token 放入 `nav_or_not`，即“压缩历史/全序列 + 精细当前观测”的双分辨率结构。
+- 当前实现有四处代码现状需留意：形参 `long_video` 和局部变量 `final_token_length_lst` 均未使用；入口声称支持 `compress_type="mean"`，但 `token_generation()` 会执行 `int("mean")` 而报错；只校验 `len(prompts) == len(image_counts)`，没有校验 `sum(image_counts) == len(image_features)`；多项输入检查使用 `assert`，在 `python -O` 下会被移除。
+
 ### 模型架构归属（NaVid vs LLaVA）
 
 - 文件头 `Copyright 2023 Haotian Liu`（LLaVA 作者）—— 本仓库模型代码是 **从 LLaVA fork 而来**，类名 `Llava*` 是未改净的痕迹。
@@ -236,6 +273,64 @@ eval_navid_vlnce.sh              # 起 8 个进程，每 GPU 一个 chunk
 - 结论：**当前状态可读代码，不可跑评测**。
 - 附带：本机 `python` 命令不存在，需用 `python3`。
 
+### RGB 帧 → 视觉 token 的完整链路（2026-10-08）
+
+三站式的转换，`encode_images()` 只是"观测编码入口"，真正把像素变成 token 的是它调用的视觉塔内部：
+
+| 站 | 位置 | 动作 | 形状 |
+| ------ | ------ | ------ | ------ |
+| ① 预处理（纯图像库） | `agent_navid.py:63` `image_processor.preprocess` | 缩放 + 归一化 | → `(N, 3, 224, 224)` |
+| ② ViT patch embedding | `eva_vit.py` 的 `PatchEmbed.forward`（`self.proj = nn.Conv2d(3, 1408, kernel_size=14, stride=14)`） | 14×14 卷积滑过 224×224 → 16×16=256 个 patch，每 patch 投成 1408 维 | → `(N, 256, 1408)` |
+| ②' 加 CLS + 39 层 transformer | `eva_vit.py` `forward_features` | 拼 CLS、加位置编码、过 39 层 | → `(N, 257, 1408)` |
+| ③ 丢 CLS | `navid_arch.py` `mm_vision_select_feature=='patch' and shape[1]%2==1` → `[:, 1:]` | 切掉首位 CLS | → `(N, 256, 1408)` |
+| ④ 网格池化压缩 | `navid_arch.py` `process_grid` | 见下节 | 每帧 → 4/16/64 个 token |
+| ⑤ 投影 | `navid_arch.py` `mm_projector`（`nn.Linear(1408 → 4096)`） | 投到 LLM 隐藏维度 | → `(N, T, 4096)` |
+| ⑥ 拼进输入序列 | `prepare_inputs_labels_for_multimodal` 装配循环 | 作为 `inputs_embeds` 的一段 | 与文本 embedding 同维 |
+
+- **丢 CLS 是硬前提，不是美化**：`process_grid` 要用 `int(shape[1] ** 0.5)` 反推网格边长再 `reshape` 成正方形，257 开方得 16 但 16×16=256≠257，不切必报形状错误。
+- **丢 CLS 用的是奇偶启发式**（`% 2 == 1`），一箭双雕：既判断"CLS 还在"，又对**已切过 CLS 的预计算特征**（`train.py:996` 的 `video_info['feats'][:, 1:]`，256 为偶数）保持幂等、不切第二次。代价是默认了"CLS 必在首位 + patch 网格数为偶数"，网格若变奇数（如 15×15）或 pkl 未带 CLS 会静默误切。
+- 训练/预计算特征近路：`long_video=True` 时 ①②③ 全部跳过（特征在数据准备阶段已算好），只在 `encode_images()` 里以 `if long_video: image_features = images` 体现。
+- 角色澄清：`prepare_inputs_labels_for_multimodal` 是**装配器**（把视觉 token 拼进文本 token 序列、同步 labels/mask），不是观察编码器；观察编码器是 `encode_images` → 视觉塔 + 网格压缩 + `mm_projector` 这条链。
+
+### `token_generation()` / `process_grid()` 的向量化压缩语义（2026-10-08）
+
+- **没有逐帧循环**：进来的 `vis_embed` 是 `(帧数, 256, 1408)`，`reshape(vis_embed.shape[0], cur_shape, cur_shape, -1)` 只把第 1 维（256 个 patch）拆成 16×16 网格，**第 0 维（帧）原样保留**；`F.avg_pool2d` 把第 0 维当 batch 维，逐帧独立池化，帧与帧之间不混合。所以"每帧压成 N 个 token"是靠维度语义天然实现的，不需要循环。
+- 池化参数：`grid_stride = cur_shape // grid_size`，且 `kernel_size = stride = grid_stride` → **不重叠分块平均**，输出每帧恰好 `grid_size²` 个 token。实测对应：`grid:8`→64（当前帧/单图）、`grid:4`→16、`grid:2`→4（本仓库实际配置，即 `nav_size=4`）。
+- 两步 `permute` 是配套的：进去时 `(0,3,1,2)` 把特征维挪到"通道"位以适配 `avg_pool2d` 的 `(N,C,H,W)` 约定，出来时 `(0,2,3,1)` 换回"最后一维是特征"并 `flatten(1,2)` 合并空间两维。
+- **唯一"单帧特判"**是导航分支的 `vis_embed[-1:]`——用**切片**取末帧以保持 3 维（写成 `[-1]` 会降成 2 维，后续 reshape 网格会错），让它单独走 `grid:8` 拿到 64 个高分辨率 token。
+- 三分支的判据是 `image_counts` 的**数值**而不只是有无：`None` 或（`==1` 且非导航）→ 单图模式 `grid:8`；`navigation` → 末帧 64 + 其余粗网格；否则 → 全部粗网格。
+
+### `image_counts` 的两种对齐语义（2026-10-08）
+
+- 它是**"每个样本各有多少帧"的账本**，创建于 `image_counts = [image.shape[0] for image in images]`，前置条件是该分支已把每个元素补成 4 维 `(帧数, 3, H, W)`，所以 `shape[0]` 就是帧数。名字里的 image 指"一个样本的图像输入"（可能是一段多帧视频），数的是**帧数**不是图片张数。
+- 它是函数**默认参数**（`None`）：当上层传入的是"一整块张量"（走 `else` 分支）时，创建语句根本不执行，于是保持 `None` 传下来。故两种取值对应两条互斥的输入形态，而非同一件事的前后阶段：
+  - `None` = 每 prompt 一条特征，**位置对齐**（`image_features[_idx, None]`，`None` 只为补回帧维使下游 reshape 成立）；
+  - `list` = 帧已被 `torch.cat(dim=0)` 拍平，**区间对齐**（`total_count` 前缀和游标 + `image_counts[_idx]` 长度切片，循环不变式：进入第 `_idx` 轮时 `total_count == sum(image_counts[: _idx])`）。
+- **长度契约 = batch size**：`assert len(prompts) == len(image_counts)`，三本账（`input_ids.shape[0]` / `prompts` / `image_counts`）同长，靠"都按 instances 顺序组装"对齐。推理时恒为 1（agent 一次一条对话）。
+- 该数值还被另两处消费：传入 `token_generation` 决定压缩模式；以及在 `vlm_attention` 尾部决定 `video_or_not` 标记（`==1` 且非导航 → `False` 单图分支，否则 `True` 视频分支）。
+- 期望的 `sum(image_counts) == len(image_features)` **没有断言**（只校验了 `len` 而非总和），是当前实现的校验缺口。
+
+### attention mask 的归属与推理期重建（2026-10-08）
+
+- **归属是 LLM 的**，不是 ViT 的：证据有三——(1) 它由 `forward()` 传入本函数、重建后作为返回值第 2 位喂给 `self.model`（`LlavaAttLlamaModel` = Llama 主干）；(2) 视觉塔那条路完全不接收 mask（`eva_vit` 只吃 `images`）；(3) 它的长度被断言等于"文本 + 展开后视觉 token"的序列长度，而该长度只存在于 LLM 输入层。
+- **语义**：1 = 可见、0 = 屏蔽（padding）。训练/prefill 时它真正干活——屏蔽 batch 内右 padding、以及在序列前部为展开出来的视觉段补 `True`（因为图像展开发生在序列前部而 tokenizer 是右 padding）。
+- **解码步为什么还要重建**：重建的是**全 1** 张量（数学上等价于无掩码，证明"不是模型需要掩码，而是接口要求长度合法"）。原因是 HF `generate` 自己维护 `model_kwargs["attention_mask"]`，其长度按**占位符展开前**的 token 数（agent 未显式传 mask，由 HF 自动造）逐step增长；而模型内部把 1 个 `-200` 展开成了几十上百个 token，于是 mask 长度 ≠ KV cache 长度，加到 attention 分数上会形状不匹配。由于 forward 的返回值不会回流进 generate 循环，**只能在 forward 内按 `past_key_values[-1][-1].shape[-2] + 1` 重建**。
+
+### `navid/model/navid_arch.py` 行号基准更新（2026-10-08）
+
+该文件在 2026-10-08 经历"随读补中文注释 + 一次纯空白格式刷新"，行号整体位移（现 870 行），本节之前各节引用的 `navid_arch.py` 行号可能已过期。**最新基准**：
+
+| 符号 | 行号 |
+|------|------|
+| `class NaVidMetaModel` | 49 |
+| `class NaVidMetaForCausalLM` | 109 |
+| `encode_images` | 118 |
+| `vlm_attention` | 144 |
+| `token_generation`（含 `process_grid`） | 293（295） |
+| `update_prompt` | 336 |
+| `prepare_inputs_labels_for_multimodal` | 341 |
+| `initialize_vision_tokenizer` | 805 |
+
 ## 技术决策
 
 | 决策 | 理由 |
@@ -247,6 +342,8 @@ eval_navid_vlnce.sh              # 起 8 个进程，每 GPU 一个 chunk
 | `builder.py:122` 的 `context_len3` 缺陷先报告不直接改 | 用户正在编辑器中编辑该文件，直接改可能与未保存内容冲突 |
 | habitat 相关结论标注为"联网核实" | 本机未安装 habitat，无法本地读源码，需明确区分证据来源 |
 | 对 habitat 源码的版本判断锚定 v0.1.7 | README 明确要求该版本；新版已从 yacs 迁到 OmegaConf，API 不兼容，混用会得出错误结论 |
+| 纯空白格式刷新用「AST 指纹 + token 流比对」做零源码改动证明 | 空白改动的风险是误伤源码；`ast.dump(ast.parse(src))` 的 sha256 相同保证语法树一致，剔除 INDENT/NEWLINE 类空白 token 后逐 `(type, string)` 比对（含 COMMENT）保证连注释都未变，再叠加 `py_compile` 三重保险 |
+| PWF 中的源码行号以「最新基准表」为准 | 文件补注释/格式刷新会使旧行号整体位移，逐个回改历史条目等于覆盖历史；改为在 findings 追加一张最新行号基准表，并声明此前引用可能过期 |
 
 ## 遇到的问题
 

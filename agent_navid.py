@@ -39,7 +39,8 @@ class NaVid_Agent(Agent):
 
         print("Initialization Complete")
 
-        
+        # prompt 模板
+        # history token 和 obs token 被插在中间
         self.promt_template = "Imagine you are a robot programmed for navigation tasks. You have been given a video of historical observations and an image of the current observation <image>. Your assigned task is: '{}'. Analyze this series of images to decide your next move, which could involve turning left or right by a specific degree or moving forward a certain distance."
 
         self.history_rgb_tensor = None
