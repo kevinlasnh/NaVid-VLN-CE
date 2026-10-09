@@ -331,6 +331,93 @@ eval_navid_vlnce.sh              # 起 8 个进程，每 GPU 一个 chunk
 | `prepare_inputs_labels_for_multimodal` | 341 |
 | `initialize_vision_tokenizer` | 805 |
 
+### `final_token` 的 expand + flatten 语义（2026-10-09）
+
+`final_token[None].expand(len(prompt), -1, -1, -1).flatten(1, 2)` 是**纯形状对齐**，不改数值：`(帧数 F, 每帧 token 数 N, LLM 维度 D)` → `(len(prompt), F×N, D)`。
+
+- **第 0 维是「对话轮次」而不是 batch**：下游用 `image_features[cur_image_idx][token_idx]` 按轮次索引；导航分支还断言 `token_idx == 0`，即导航只允许单轮。
+- **`len(prompt)` ≠ `len(prompts)`**：前者是单条样本内部的对话轮数，后者是 batch size。推理期 `update_prompt([[cur_prompt]])` 决定两者都是 1，`expand` 在形状上是空转，但保持了与训练代码一致的接口契约。
+- `expand` 靠把该维 stride 置 0 实现零拷贝广播，`-1` 表示该维保持原样。该语句**无条件**执行；对称的 `final_token_nav` 版本只在「导航 + `image_counts` 非 None」时执行，因为只有那条分支的下游会索引它。
+- `flatten` 后第 1 维 = `帧数 × 每帧token数`，与紧随其后的三条断言（`final_token_nav.shape[1] == 64`、`final_token.shape[1] == nav_size`、`final_token.shape[1] == 64`）互相印证。
+- 该 flatten 的直接用途：下游拿到扁平的 `F×N` 序列后，按 `nav_size` 一组切回去、**组间插 `seperator_token`**，即"压平成一条序列再还原成逐帧 token 组"。
+
+### 路由标记 `video_or_not` / `nav_or_not` 的完整语义（2026-10-09）
+
+`vlm_attention` 返回的两张标记是交给下游的**路由表**，长度 = batch size，按样本号下标对齐。
+
+- **`video_or_not` 命名具有误导性**：它不表示"是不是视频"，而表示"下游要不要走「按 `nav_size` 切组 + 组间插分隔符」的分支"。判据是「帧数 > 1」**或**「单帧但导航」——单帧导航也填 `True`，正说明它跟"是不是视频"无关。函数内的注释用"单图拼装 / 视觉拼装"描述它比变量名准确。
+- `nav_or_not` 的元素是导航任务额外那 64 个高分辨率当前帧 token（`(1, 64, 4096)`），非导航为 `None`。
+- 下游三种拼装模式一一对应：
+
+  | `nav_or_not` | `video_or_not` | 下游行为 |
+  |---|---|---|
+  | `None` | `False` | 整块视觉 token 直接追加（断言 `shape[0] == 64`） |
+  | `None` | `True` | 按 `nav_size` 切组，组间插 `seperator_token` |
+  | 张量 | `True` | 切组插分隔符后，再追加 nav token |
+
+- 两个标记列表的长度恒定等于循环次数（每轮各 append 一次），这个"长度守恒"是下游按 `_idx` 查表的前提。
+- 导航样本与 `image_counts is None` 是**互斥**的：`vlm_attention` 开头就 `raise`，因此 `image_counts is None` 那条 `else` 分支可以放心写死 `nav_or_not = None`。
+
+### `prepare_inputs_labels_for_multimodal` 五元组返回与解包契约（2026-10-09）
+
+```python
+return None, attention_mask, past_key_values, new_input_embeds, new_labels
+```
+
+调用方 `llava_navid.py` 按**位置**解包成 `input_ids / attention_mask / past_key_values / inputs_embeds / labels` —— 靠位置对应，不靠名字，因此返回端必须凑够 5 个元素，少一个调用方直接 `ValueError`。
+
+| 位 | 返回 | 落到调用方 | 说明 |
+|:-:|------|------|------|
+| 1 | `None` | `input_ids` | **故意作废**：装配后序列长度已变，原 `input_ids` 对不上；若与 `inputs_embeds` 同时传入，HF 会以 `input_ids` 为准或报错 |
+| 2 | `attention_mask` | `attention_mask` | **被重建过**（左补 `True` 给展开的视觉 token，右侧补 `False` 给 padding） |
+| 3 | `past_key_values` | `past_key_values` | 原样透传，本函数不修改 |
+| 4 | `new_input_embeds` | `inputs_embeds` | **最终输入序列本体**（在调用方被重命名，同一个东西两个名字） |
+| 5 | `new_labels` | `labels` | 与第 4 位**逐位对齐**的训练答案纸（有 assert 保证） |
+
+### 装配器主体（`prepare_inputs_labels_for_multimodal` 后半段）的结构（2026-10-09）
+
+按样本循环，四件事：
+
+1. **无图样本的近路**：样本内不含 `IMAGE_TOKEN_INDEX` 时，把文本切成两半分别 embed，中间夹一个**零长度**的 `cur_image_features[0:0]`；代码注释标明这是 DeepSpeed ZeRO-3 的 hack（保持计算图里对该参数的依赖，避免"未使用参数"报错）。
+2. **三套拼装**：按路由标记走「单图整块 / 切组插分隔符 / 切组 + nav 尾巴」；导航那条还额外接上占位符**后面两个**文本 token 与 nav token，因此其 `cur_input_ids` 要切 `[start+3:]`（其余切 `[start+1:]`）。
+3. **labels 镜像填充**：每拼一段就填同样长度的 `IGNORE_INDEX`(-100)，保证 labels 与 embeddings 严格同长，且视觉 token / 分隔符 / padding 不产生梯度。
+4. **收口**：各样本长度不一 → 右补零向量 + labels 补 `IGNORE_INDEX` + attention mask **左补 `True`、右补 `False`**；长度一致 → 直接 `stack`，只左补 `True`。
+
+- 每轮扫完一个占位符就地截断 `cur_input_ids` 并重算占位符位置，直到样本内占位符耗尽。
+- `long_video=True` 走**完全不同的快路径**：预分配全零张量，把文本 embedding 与**预计算好的**视觉特征分别 scatter 到各自位置，不做展开也不插分隔符；其中还有一段"推理期权重与输入不在同一设备则搬回"的分支。
+
+### 代码归属边界：哪些是原版、哪些是本仓库改造（2026-10-09）
+
+**Llama 主干（含注意力）是 HuggingFace 原版，本仓库零改动。**
+
+- `self.model = LlavaAttLlamaModel(config)`，该类为 `NaVidMetaModel + LlamaModel` 组合，**未重写 `forward`**：`NaVidMetaModel` 只有 4 个方法（`__init__` / `get_vision_tower` / `initialize_vision_modules` / `initialize_attention_modules`）。
+- `initialize_attention_modules` 函数体只有三行，实质只做 `self.config.compress_type = getattr(model_args, "compress_type", None)`，**不创建任何注意力模块**；类名里的 "Att" 是 LLaMA-VID 血统的残留命名，具有误导性。
+- 因此 attention 公式（Q/K/V 投影、RoPE、缩放点积、输出投影）、KV cache、`generate` 循环全部在 `transformers` 库内。调用链为：`llava_navid.forward` → `self.model(...)`（= `LlamaModel.forward`）→ 32 层 `LlamaDecoderLayer` → `LlamaAttention`。
+- **NaVid 的改造全在"进主干之前"**：视觉编码 + token 压缩 + 序列装配 + mask/labels 对齐。主干不知道输入里混了图像——它只看到一串向量。
+- 由此可推出：`nav_size` / `compress_type` 这类压缩超参直接决定主干开销（序列长度），是这套架构的性能杠杆；而 `self.model` 只是"编码器"，完整的模型是 `LlavaLlamaAttForCausalLM`（`self.model` + `self.lm_head`），主干输出还要过 `lm_head` 才得到 logits。
+- **训练代码实际存在于 `navid/train/train.py`**（其中调用 `initialize_attention_modules`），仓库**根目录**没有 `train.py`；NaVid 的**评估链路不经过它**。
+
+### `navid/model/navid_arch.py` 行号基准更新（2026-10-09）
+
+该文件因用户持续随读补中文注释而反复位移（现 **878 行**）。**最新基准**（引用行号时以本表为准）：
+
+| 符号 | 行号 |
+|------|------|
+| `class NaVidMetaModel` | 49 |
+| `initialize_attention_modules` | 103 |
+| `class NaVidMetaForCausalLM` | 109 |
+| `encode_images` | 118 |
+| `encode_images` 的 return | 140 |
+| `vlm_attention` | 144 |
+| `vlm_attention` 的 return | 292 |
+| `token_generation`（含 `process_grid`） | 300 |
+| `update_prompt` | 343 |
+| `prepare_inputs_labels_for_multimodal` | 348 |
+| 五元组 return | 811 |
+| `initialize_vision_tokenizer` | 813 |
+
+> 2026-10-08 的旧基准表对应 870 行版本，此后文件净增 8 行（用户新增注释），两表差异约 3–6 行。由于行号仍在持续变动，本仓库文档**优先按符号名引用**，行号仅作定位辅助。
+
 ## 技术决策
 
 | 决策 | 理由 |
@@ -344,6 +431,8 @@ eval_navid_vlnce.sh              # 起 8 个进程，每 GPU 一个 chunk
 | 对 habitat 源码的版本判断锚定 v0.1.7 | README 明确要求该版本；新版已从 yacs 迁到 OmegaConf，API 不兼容，混用会得出错误结论 |
 | 纯空白格式刷新用「AST 指纹 + token 流比对」做零源码改动证明 | 空白改动的风险是误伤源码；`ast.dump(ast.parse(src))` 的 sha256 相同保证语法树一致，剔除 INDENT/NEWLINE 类空白 token 后逐 `(type, string)` 比对（含 COMMENT）保证连注释都未变，再叠加 `py_compile` 三重保险 |
 | PWF 中的源码行号以「最新基准表」为准 | 文件补注释/格式刷新会使旧行号整体位移，逐个回改历史条目等于覆盖历史；改为在 findings 追加一张最新行号基准表，并声明此前引用可能过期 |
+| 判断「某功能是否被改造」以**方法定义清单 + MRO**为准，不信类名 | `LlavaAttLlamaModel` / `initialize_attention_modules` 都带误导性的 "Att"，实际未添加任何注意力模块；只看类名会得出错误结论 |
+| 行号引用优先用符号名，行号仅作定位辅助 | 用户持续在同一文件上随读补注释，行号每次会话都在位移（870 → 878 行），纯行号引用很快失效 |
 
 ## 遇到的问题
 
@@ -355,6 +444,8 @@ eval_navid_vlnce.sh              # 起 8 个进程，每 GPU 一个 chunk
 | 本机未安装 habitat，无法读源码验证结论 | 改用联网核实 habitat-lab v0.1.7 对应文件（`config/default.py`、`core/env.py`、`core/dataset.py`、`datasets/registration.py`），并在 findings 中标注来源 |
 | 本机无 `python` 命令 | 改用 `python3`（`python3 -m py_compile` 验证语法） |
 | 编辑 `findings.md` 时误删 `## 技术决策` 标题 | 立即用 grep 检查章节结构发现，恢复标题并补入本会话决策 |
+| 曾断言 `token_generation` 的 `vis_embed_nav` 在非导航分支未定义、会抛 `NameError` | **误判，已撤回**：条件表达式短路求值，`navigation=False` 时不读取该变量；风险组合（`navigation=True` + `image_counts=None`）已被上游 `raise` 挡死，且该函数全仓库仅一处调用点。改记为「依赖调用方守卫的脆弱点」，非可达缺陷 |
+| 曾称「本仓库无 train.py」 | 仅指仓库根目录；训练代码在 `navid/train/train.py`。此后表述文件缺失必须限定路径 |
 
 ## 资源
 

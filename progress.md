@@ -98,6 +98,31 @@
   - `navid/model/navid_arch.py`（本次仅 4 行空白改动；其余为该文件随读随补的中文注释，共 870 行）
   - `agent_navid.py`、`navid/model/language_model/llava_navid.py`（随读随补的中文注释）
 
+## 会话：2026-10-09
+
+### 阶段 3：装配器主体与代码归属边界（模型侧链路收口）
+- **状态：** in_progress（模型侧链路全线打通）
+- **开始时间：** 2026-10-09 11:06:47 +0800
+- 执行的操作：
+  - 会话启动：读取 PWF 三件套并汇报上次停点（阶段 2/3 交界）
+  - 讲解 `final_token` 的 `[None] → expand(len(prompt)) → flatten(1, 2)`：确认其第 0 维是**对话轮次**（下游用 `[token_idx]` 索引）、`len(prompt)` 与 `len(prompts)` 的区别、推理期恒为 1 的契约含义
+  - 讲解路由标记段（`if image_counts is not None:` 及其两支）：把 `video_or_not` / `nav_or_not` 的判定条件与下游三种拼装模式逐一对上；指出 `video_or_not` 命名误导
+  - 讲解 `vlm_attention` 的三元组返回，以及 `encode_images` 的原样转手
+  - 通读并总结装配器主体：无图样本的 DeepSpeed ZeRO-3 hack、三套拼装分支、labels 镜像填 `IGNORE_INDEX`、`long_video` 的 scatter 快路径、长度对齐两条分支（右补零 + mask 左补 True / 右补 False）
+  - 讲解五元组返回并与调用方解包逐位对齐（第 1 位 `None` 落到 `input_ids`、第 4 位 `new_input_embeds` 落到 `inputs_embeds`）
+  - 讲解 `llava_navid.py:189` 的 `self.model(...)`：确认这是进入 Transformer 主干的入口，attention 数学在 HF 原版 `LlamaModel` → `LlamaDecoderLayer` → `LlamaAttention` 之内
+  - 确认代码归属边界：`LlavaAttLlamaModel` 未重写 `forward`；`initialize_attention_modules` 是空壳（只设 `config.compress_type`），类名里的 "Att" 是 LLaMA-VID 残留
+  - 核实 `token_generation` 全仓库仅一处调用点，撤回此前对 `vis_embed_nav` 的「疑似 bug」判断
+- 创建/修改的文件：
+  - 无（本会话为纯讲解；`navid_arch.py` 工作区的 +3 行改动为用户自行补充的中文注释）
+- 新发现（详见 `findings.md`）：
+  - `final_token` 的 expand/flatten 语义与「轮次维」契约
+  - 路由标记的完整语义表（含 `video_or_not` 命名误导）
+  - 五元组返回的逐位含义与「靠位置不靠名字」的解包契约
+  - 装配器主体的四段结构与 `long_video` 快路径
+  - **代码归属边界**：Llama 主干（含 attention、KV cache、generate 循环）为 HF 原版零改动，NaVid 改造全在「进主干之前」
+  - 训练代码实际位于 `navid/train/train.py`（评估链路不经过）
+
 ## 测试结果
 | 测试 | 输入 | 预期结果 | 实际结果 | 状态 |
 |------|------|---------|---------|------|
@@ -112,6 +137,10 @@
 | habitat 运行环境探测 | `python3 -c "import habitat"` / `find / -name habitat` | 确认是否可本地读源码 | `ModuleNotFoundError`，全盘无 habitat 包，本机未安装 | 未通过（环境缺失，改用联网核实） |
 | `navid_arch.py` 格式刷新的语义一致性 | AST 指纹（`ast.dump` 的 sha256）+ 剔除空白 token 后逐 token 比对（含注释） | 源码零改动 | 前后 AST 指纹相同、3996 个有效 token 逐一相同、`py_compile` 通过 | 通过 |
 | PWF 记录后源码可编译性 | `python3 -m py_compile navid/model/navid_arch.py navid/model/language_model/llava_navid.py` | 编译通过 | 通过 | 通过 |
+| 用户补注释后源码可编译性 | `python3 -m py_compile navid/model/navid_arch.py navid/model/language_model/llava_navid.py` | 编译通过 | 通过（已清理 `__pycache__`） | 通过 |
+| `token_generation` 调用点核查 | `grep -rn "token_generation" --include=*.py .` | 确认调用点数量 | 全仓库仅 `navid_arch.py` 一处（函数定义行除外） | 通过 |
+| Llama 主干是否被重写 | 检查 `llava_navid.py` 的 `def forward` 出现位置 + `navid_arch.py` 的方法清单 | 确认类结构 | `LlavaAttLlamaModel` 未重写 `forward`；`NaVidMetaModel` 仅 4 个方法 | 通过 |
+| 用户补注释的语义一致性 | `ast.dump(ast.parse(src))` 的 sha256，对比 `HEAD:navid/model/navid_arch.py` 与工作区 | 源码零逻辑改动 | 两侧指纹同为 `8495070d…b86c`，完全一致 | 通过 |
 
 ## 错误日志
 | 时间戳 | 错误 | 尝试次数 | 解决方案 |
@@ -120,15 +149,17 @@
 | 2026-09-28 11:17:43 +0800 | `git remote rename origin upstream` 自动把 main 的跟踪改为 `upstream/main` | 1 | 显式执行 `git branch --set-upstream-to=origin/main main` 重新绑定 |
 | 2026-09-29 10:05:33 +0800 | 本机 `python3 -c "import habitat"` 报 `ModuleNotFoundError`，`find / -name habitat` 无结果 —— 无法本地读 habitat-lab 源码 | 1 | 改用联网核实 habitat-lab v0.1.7 源码（`Config`/`Env`/`Dataset`/`make_dataset`），并在结论中标注证据来源为联网而非本地 |
 | 2026-09-29 10:05:33 +0800 | 发现 `navid/model/builder.py:122` 为 `context_len3`（本会话工作区新引入），会抛 `NameError` 导致评测无法启动 | 1 | **已修复**：用户自行改回 `context_len`，`python3 -m py_compile navid/model/builder.py` 通过 |
+| 2026-10-09 11:06:47 +0800 | （AI 判断错误，非运行错误）曾断言 `token_generation` 中的 `vis_embed_nav` 在非导航分支未定义、会抛 `NameError` | 1 | 回读守卫条件与全部调用点后**撤回**：该行是条件表达式，`navigation=False` 时短路求值 `None`、不读取该变量；唯一风险组合已被 `vlm_attention` 的 `raise` 挡死。教训：判断「某分支是否可达」必须先核查全部入口守卫，不能只看局部 |
+| 2026-10-09 11:06:47 +0800 | （表述错误）曾称「本仓库无 train.py」 | 1 | 该说法仅对仓库根目录成立；训练代码实际在 `navid/train/train.py`。今后「仓库无某文件」必须限定路径 |
 
 ## 五问重启检查
 | 问题 | 答案 |
 |------|------|
-| 我在哪里？ | 阶段 2/3 交界：`navid_arch.py` 的 `prepare_inputs_labels_for_multimodal`、`encode_images`、`vlm_attention`、`token_generation` 均已读通，视觉 token 压缩链路闭环 |
-| 我要去哪里？ | 补装配循环剩余细节与 `eva_vit.py` 快扫，再回 `agent_navid.py` 把 `predict_inference` / `extract_result` 与模型侧对上 |
+| 我在哪里？ | 阶段 2/3 交界：模型侧完整链路已全线打通（`run.py` → `builder.py` → `llava_navid.py` → `navid_arch.py` 装配器 → HF 原版 Llama 主干），并确认了代码归属边界 |
+| 我要去哪里？ | 回 `agent_navid.py` 把 `predict_inference` / `extract_result` / 动作队列与模型侧对齐；`eva_vit.py` 快扫；阶段 3 剩余三项（历史帧增量复用、特殊 token 替换与跳过、KV cache 边界） |
 | 目标是什么？ | 系统读懂 NaVid-VLN-CE 的完整推理链路与核心机制 |
-| 我学到了什么？ | 见 findings.md（配置五层合并、yacs CfgNode 体系、早停语义修正、代码缺陷、VLN-CE 三层职责、builder.py 实际执行路径、Llava/NaVid 模型调用链、RGB→视觉 token 三站链路、`image_counts` 双语义、attention mask 归属与重建原因、`token_generation` 向量化压缩语义） |
-| 我做了什么？ | 完成 fork 与远端重绑并验证写权限；完成仓库侦察；建立 PWF 三件套；完成 `run.py`、`builder.py`、`llava_navid.py` 精读；厘清 habitat/VLN-CE/NaVid 分层职责；完成 `navid_arch.py` 多模态装配与视觉压缩主干精读；对 `navid_arch.py` 做纯空白格式刷新并验证零源码改动 |
+| 我学到了什么？ | 见 findings.md（配置五层合并、yacs CfgNode 体系、早停语义修正、代码缺陷、VLN-CE 三层职责、builder.py 实际执行路径、Llava/NaVid 模型调用链、RGB→视觉 token 三站链路、`image_counts` 双语义、attention mask 归属与重建原因、`token_generation` 向量化压缩语义、`final_token` 的 expand/flatten 与轮次维契约、路由标记语义表、五元组返回与解包契约、装配器主体四段结构、**代码归属边界「主干是原版、改造在之前」**、`navid_arch.py` 最新行号基准） |
+| 我做了什么？ | 完成 fork 与远端重绑并验证写权限；完成仓库侦察；建立 PWF 三件套；完成 `run.py`、`builder.py`、`llava_navid.py` 精读；厘清 habitat/VLN-CE/NaVid 分层职责；完成 `navid_arch.py` 多模态装配与视觉压缩主干精读；通读装配器主体并确认 HF 代码归属边界；对 `navid_arch.py` 做纯空白格式刷新并验证零源码改动 |
 
 ---
 *每个阶段完成后或遇到错误时更新此文件*

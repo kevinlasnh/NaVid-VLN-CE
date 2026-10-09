@@ -14,9 +14,15 @@
 2. `navid/model/multimodal_encoder/eva_vit.py` 快扫（只看输入尺寸、patch 数、输出维度、惰性加载）
 3. 回看 `agent_navid.py` 的 `predict_inference()` / `extract_result()` / 动作队列，把 agent 侧输入格式与模型侧拼装对上
 
+2026-10-09 更新：上述三项中**第 1 项（装配循环剩余细节）已完成** —— 模型侧链路全线打通（`vlm_attention` 的路由标记 → `prepare_inputs_labels_for_multimodal` 的装配主体 → `llava_navid.forward()` 调用主干），并确认了 HF 代码归属边界。当前下一步：
+
+1. 回看 `agent_navid.py` 的 `predict_inference()` / `extract_result()` / 动作队列，把 agent 侧输入格式与模型侧拼装对上（原第 3 项，顺延）
+2. `navid/model/multimodal_encoder/eva_vit.py` 快扫（原第 2 项，顺延）
+3. 阶段 3 剩余三项：历史帧增量复用机制、特殊 token 在 `input_ids` 中的替换与跳过、KV cache / 历史视觉 token 复用的真实边界
+
 ## 当前阶段
 
-阶段 2/3 交界：模型侧主干精读完成（`run.py`、`navid/model/builder.py`、`llava_navid.py`、`navid_arch.py` 的多模态装配与视觉压缩链路），agent 侧 `predict_inference` 细节待补
+阶段 2/3 交界：模型侧完整链路（`run.py` → `builder.py` → `llava_navid.py` → `navid_arch.py` 装配器 → HF 原版 Llama 主干）已读通并确认代码归属边界；剩余为 agent 侧细节（`predict_inference` / `extract_result` / 动作队列）与 `eva_vit.py` 快扫
 
 ## 各阶段
 
@@ -52,6 +58,7 @@
 ### 阶段 3：模型侧核心机制
 - [x] `prepare_inputs_labels_for_multimodal`（现从 341 行起，全文件核心）：主干、提前返回、两种输入形态归一、三分支装配、labels/mask 对齐均已读通
 - [x] token 压缩的池化数学（token_generation + process_grid）：向量化语义、grid 与 nav_size 的对应关系已确认
+- [x] 装配器主体与代码归属边界（2026-10-09）：`new_input_embeds` 拼装顺序、三套拼装分支、labels 镜像填充、`long_video` 的 scatter 快路径、长度对齐两条分支（含 attention mask 重建）均已读通；并确认 Llama 主干（含 attention）为 HF 原版代码、NaVid 的改造全在「进主干之前」
 - [ ] 历史帧增量复用机制（process_images + prepare_inputs_labels_for_multimodal）
 - [ ] 特殊 token 在 input_ids 中的替换与跳过逻辑
 - [ ] KV cache / 历史视觉 token 复用的真实边界
@@ -83,6 +90,7 @@
 3. ~~用户尚未选定学习路线，这决定阶段 2 的展开方式。~~ **已解决**：用户选定模型侧路线（模型如何搭建），阶段 2 转为 `builder.py` → `llava_navid.py` → `navid_arch.py`。
 4. ~~`navid/model/builder.py:122` 的 `context_len3` 缺陷是否修复？~~ **已解决**：用户已改回 `context_len`，`py_compile` 通过。
 5. `agent_navid.py:317` 的 `require_data` 条件写错（`"video"` 应为 `"data"`），以及 `NaVid_Agent.__init__` 的 `require_map` 参数错位 —— 是否修复？**待用户决定**（两者都会改变 `EXP_SAVE="data"` 的行为）。
+6. ~~`token_generation` 里 `vis_embed_nav` 是否在非导航分支未定义（疑似 `NameError`）？~~ **已解决**（2026-10-09）：**不是 bug**。该行是条件表达式，`navigation=False` 时走 `else` 分支求值 `None`，根本不读取该变量；唯一风险组合（`navigation=True` 且 `image_counts=None`）已被 `vlm_attention` 的 `raise ValueError` 挡死，且 `token_generation` 全仓库只有一处调用点。准确结论：属「依赖调用方守卫」的脆弱点，非可达缺陷。
 
 ## 已做决策
 

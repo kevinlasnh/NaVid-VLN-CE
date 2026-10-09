@@ -245,11 +245,14 @@ class NaVidMetaForCausalLM(ABC):
             if is_navigation and final_token_nav is None:
                 raise ValueError('[Navigation] wrong')
 
+            # 把输出展开到 4 维再合并到 3 维
             final_token = (
-                final_token[None]
-                .expand(len(prompt), -1, -1, -1)
-                .flatten(1, 2)
+                final_token[None] # 在最前面加一个维度，变成 (1, 帧数, 每帧 token 数, LLM 维度)
+                .expand(len(prompt), -1, -1, -1) # 这里把长度维 1 的维度撑开到指定的长度，-1 表示占位，表示该维度不变
+                .flatten(1, 2) # 按照第 1 维和第 2 维展平，变成 (len(prompt), 帧数 * 每帧 token 数, LLM 维度)
             )
+
+            # 看这一样本的视觉 token 到下游改用哪种拼法
             if image_counts is not None:
                 if is_navigation:
                     final_token_nav = (
@@ -282,6 +285,10 @@ class NaVidMetaForCausalLM(ABC):
 
             img_feat_lst.append(final_token)
 
+        # 最终返回这三个东西
+        # 1. 投影到 LLM 维度的视觉 token 序列
+        # 2. 每个样本是单图还是视频的标记
+        # 3. 每个样本的导航任务当前帧的高分辨率 token（非导航样本为 None）
         return img_feat_lst, video_or_not, nav_or_not
 
     '''
@@ -800,6 +807,7 @@ class NaVidMetaForCausalLM(ABC):
                 )
                 assert attention_mask.shape == new_input_embeds.shape[:2]
 
+        # 返回结果
         return None, attention_mask, past_key_values, new_input_embeds, new_labels
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
